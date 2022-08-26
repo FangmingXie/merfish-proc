@@ -16,6 +16,12 @@ logging.basicConfig(format='%(asctime)s - %(message)s',
                     level=logging.INFO,
                     )
 
+pbar = tqdm(0)
+def update(*a):
+    """take whatever results from myfunc and don't care
+    """
+    pbar.update()
+
 def savefig(fig, path):
     """
     """
@@ -70,6 +76,7 @@ def pseudofunc_run_one_pos(posname, dataset, image_metadata_nuc, x_window, y_win
     """
     Caution: very sloppy - use many variables outside
     """
+    pbar = tqdm(0) # dummy
 
     img_nuc = image_metadata_nuc.stkread(Position=posname, Channel='DeepBlue').max(2) # max across z?
     output = os.path.join(figdir, f'fig1-1_dapi_{dataset}_{posname}.pdf')
@@ -91,13 +98,19 @@ def pseudofunc_run_one_pos(posname, dataset, image_metadata_nuc, x_window, y_win
 
     # Registration 
     Input = [hybe for readout_probe,hybe,channel in bitmap if not hybe==parameters['ref_hybe']]
-    # pfunc_reg(parameters['ref_hybe'])
-    # ncpu = 10
-    # with multiprocessing.Pool(ncpu) as p:
-    for i in Input:
-        pfunc_reg(i, metadata_path, dataset, posname, cword_config)
 
+    logging.info("Registration")
+    ncpu = min(len(Input), 6)
+    pool = multiprocessing.Pool(ncpu)
+    pbar.reset()
+    pbar = tqdm(Input)
+    for i in Input:
+        pool.apply_async(pfunc_reg, args=(i, metadata_path, dataset, posname, cword_config), callback=update)
+    pool.close()
+    pool.join()
+    
     ### Image
+    logging.info("Image and spot proc")
     Input = []
     hybe = 'hybe2'
     channel = 'FarRed'
@@ -109,24 +122,25 @@ def pseudofunc_run_one_pos(posname, dataset, image_metadata_nuc, x_window, y_win
             data = {'hybe':hybe,'channel':channel,'zindex':zindex}
             Input.append(data)
 
-    # ncpu = 10
-    # with multiprocessing.Pool(ncpu) as p:
+    ncpu = min(len(Input), 6)
+    pool = multiprocessing.Pool(ncpu)
+    pbar.reset()
+    pbar = tqdm(Input)
     for i in Input:
-        pfunc_img(i, metadata_path, dataset, posname, cword_config)
+        pool.apply_async(pfunc_img, args=(i, metadata_path, dataset, posname, cword_config), callback=update)
+    pool.close()
+    pool.join()
 
     # Get results and plot 
     nbits = len(bitmap)
-    Input = []
-    hybe = 'hybe2'
-    channel = 'FarRed'
-    self = Stack_Class(metadata_path,dataset,posname,hybe,channel,cword_config,verbose=False)
-    self.check_projection()
-    zindexes = self.zindexes
+    # Input = []
+    # hybe = 'hybe2'
+    # channel = 'FarRed'
+    # self = Stack_Class(metadata_path,dataset,posname,hybe,channel,cword_config,verbose=False)
+    # self.check_projection()
+    # zindexes = self.zindexes
 
     zindex = str(zindexes[0])
-    # stks = {}
-    # raw_dapis = {}
-
     rawimgs = {}
     imgs = {}
     spots_coords = {}
@@ -207,7 +221,94 @@ def pseudofunc_run_one_pos(posname, dataset, image_metadata_nuc, x_window, y_win
     savefig_autodate(fig, output)
     plt.show()
 
-def main(figdir, metadata_path, cword_config, ):
+    # barcodes
+    zindex = 0 # this is very important (otherwise z='0')
+    self = Classify_Class(metadata_path,dataset,posname,zindex,cword_config,verbose=True)
+    self.parameters['spot_max_distance'] = 20
+    self.parameters['spot_minmass'] = 5
+    self.parameters['spot_diameter'] = 5
+    self.parameters['spot_separation'] = 5
+
+    self.call_spots()
+    self.pair_spots()
+    self.build_barcodes()
+    self.assign_codewords()
+    self.collapse_spots()
+
+    codebook = self.merfish_config.codebook
+    transcripts = self.transcripts
+    transcripts['gene'] = codebook.index[transcripts.cword_idx]
+    transcripts_idx = transcripts['idx'].astype(int)
+    cond = transcripts['gene'].str.contains("^blank")
+    A = transcripts[cond] #.shape, 
+    B = transcripts[~cond] #.shape
+    obs_blank = len(A)/(len(B)+len(A))
+    obsoverexp_blank = obs_blank/(17/187)
+    measured_barcodes = self.measured_barcodes.numpy()
+    updated_measured_barcodes = self.updatad_measured_barcodes.numpy()
+
+    output = os.path.join(figdir, f'fig3-1_barcodes_{dataset}_{posname}.pdf')
+    logging.info(output)
+    fig, ax = plt.subplots(figsize=(10,5))
+    val = measured_barcodes.sum(axis=0).astype(int)
+    ax.plot(val, 'o', color='gray', label='measured; all')
+
+    val = measured_barcodes[transcripts_idx].sum(axis=0).astype(int)
+    ax.plot(val, 'o', color='k', label='measured; transcripts')
+
+    val = updated_measured_barcodes.sum(axis=0).astype(int)
+    ax.plot(val, 'o', label='updated; all')
+
+    val = updated_measured_barcodes[transcripts_idx].sum(axis=0).astype(int)
+    ax.plot(val, 'o', label='updated; transcripts')
+    ax.set_title(f'{dataset}; {posname} \n Observed blank: {100*obs_blank:.1f}%; Obs/Exp: {obsoverexp_blank:.2f}')
+
+    ax.set_xticks(np.arange(18))
+    ax.set_xlabel('bit/hybe')
+    ax.set_ylabel('number of positives')
+    ax.legend(bbox_to_anchor=(1,1))
+    savefig_autodate(fig, output)
+    plt.show()
+
+    output = os.path.join(figdir, f'fig3-2_barcodes_{dataset}_{posname}.pdf')
+    logging.info(output)
+    fig, axs = plt.subplots(1,2,figsize=(7*2,7), sharex=True, sharey=True)
+    ax = axs[0]
+    ax.set_title('Detected Transcripts')
+    c=transcripts['signal-noise']
+    vmin,vmax= np.percentile(c, [5,95])
+    g = ax.scatter(transcripts.x,
+                transcripts.y,
+                c=c,
+                s=1,
+                vmin=vmin,
+                vmax=vmax,
+                cmap='jet', 
+                rasterized=True,
+                )
+    fig.colorbar(g, ax=ax)
+    ax = axs[1]
+    ax.set_title('Detected Transcripts')
+    ax.scatter(transcripts.x,
+            transcripts.y,
+            c='gray',
+            s=1,
+            label='all',
+            rasterized=True,
+            )
+    ax.scatter(A.x,
+            A.y,
+            c='C1',
+            s=2,
+            rasterized=True,
+            label='blanks',
+            )
+    ax.legend()
+    savefig_autodate(fig, output)
+    plt.show()
+
+
+def main(figdir, metadata_path, cword_config, overwrite=True):
     """
     """
     config = importlib.import_module(cword_config)
@@ -248,18 +349,18 @@ def main(figdir, metadata_path, cword_config, ):
                 print(e)
         pseudofunc_run_one_pos(posname, dataset, image_metadata_nuc, x_window, y_window, parameters, figdir, bitmap)
 
-        break ### this is to test
+        break ### !!!! this is to test
 
 
 if __name__ == '__main__':
     ### input
     figdir = '/bigstore/GeneralStorage/fangming/projects/test_merfish/figures'
     cword_config = 'merfish_config_zebrafinch_18bits_bigruns'
-    overwrite = True
+    overwrite = True # False # True should be the default
     metadata_paths = [
         '/bigstore/Images2022/Gaby/Zebrafinch/C0_2022Jul25/',
-        '/bigstore/Images2022/Gaby/Zebrafinch/Zebra_B0_2022Jul11/',
-        '/bigstore/Images2022/Gaby/Zebrafinch/A3_2022Feb29/',
+        # '/bigstore/Images2022/Gaby/Zebrafinch/Zebra_B0_2022Jul11/',
+        # '/bigstore/Images2022/Gaby/Zebrafinch/A3_2022Feb29/',
     ]
     for metadata_path in metadata_paths:
-        main(figdir, metadata_path, cword_config, )
+        main(figdir, metadata_path, cword_config, overwrite=overwrite)
